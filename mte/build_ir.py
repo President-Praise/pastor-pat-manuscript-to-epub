@@ -39,6 +39,11 @@ _ORDERED_ITEM_RE = re.compile(
     re.DOTALL,
 )
 _BULLET_CHARS = "•●◆◇◈❖❦♚♛✧✩✪★☆❧⚜❈❃❊*·"
+# Interior bullets used to split a single visual line that packs multiple
+# bullet items ("• Foo • Bar • Baz"). Narrower than _BULLET_CHARS because
+# `*` and `·` show up mid-word in body text and would over-split.
+_INTERIOR_BULLET_CHARS = "•●◆◇◈❖❦❈❃❊"
+_INTERIOR_BULLET_RE = re.compile(r"\s*[" + re.escape(_INTERIOR_BULLET_CHARS) + r"]\s*")
 # Body normally has a space after "•" but PDFs sometimes render it without
 # ("•The Lord..."). Accept the missing-space form only when followed by a
 # letter or opening quote/bracket — the same fix already applied to
@@ -89,6 +94,40 @@ def _make_run(cl: ClassifiedLine) -> TextRun:
     )
 
 
+def _make_runs_from_spans(cl: ClassifiedLine) -> list[TextRun]:
+    """Convert one line into TextRuns grouped by (bold, italic) span style.
+
+    Per-span grouping preserves within-line style boundaries a line-level
+    ratio would flatten — critical for lines that pack an italic quote tail
+    and a bold scripture citation onto the same visual row. Falls back to a
+    line-level run when the line has no span detail.
+    """
+    ln = cl.line
+    if not ln.spans:
+        text = cl.text.strip()
+        if not text:
+            return []
+        return [TextRun(
+            text=text,
+            bold=ln.bold_ratio > 0.5,
+            italic=ln.italic_ratio > 0.5,
+        )]
+    runs: list[TextRun] = []
+    for span in ln.spans:
+        text = span.text
+        if not text:
+            continue
+        if runs and runs[-1].bold == span.bold and runs[-1].italic == span.italic:
+            runs[-1].text += text
+        else:
+            runs.append(TextRun(text=text, bold=span.bold, italic=span.italic))
+    if runs:
+        runs[0].text = runs[0].text.lstrip()
+        runs[-1].text = runs[-1].text.rstrip()
+        runs = [r for r in runs if r.text]
+    return runs
+
+
 def _run(text: str, bold: bool = False, italic: bool = False) -> TextRun:
     return TextRun(text=text, bold=bold, italic=italic)
 
@@ -107,7 +146,15 @@ def _detect_list_item(text: str) -> tuple[str, str] | None:
 
 
 def _paragraph_align(cl: ClassifiedLine) -> str:
-    return "center" if cl.line.is_centered else "left"
+    ln = cl.line
+    if not ln.is_centered:
+        return "left"
+    # A "centered" single line that spans most of the page width is really
+    # body text — fully-justified wrap lines have symmetric margins by
+    # definition. Same guard as _paragraph_align_multi.
+    if (ln.x1 - ln.x0) > ln.page_width * 0.70:
+        return "left"
+    return "center"
 
 
 def _paragraph_align_multi(cls: list[ClassifiedLine]) -> str:
@@ -330,11 +377,12 @@ def _line_to_simple_block(cl: ClassifiedLine) -> Block | None:
         return None
     if label == "scene-break":
         return SceneBreak()
+    runs = _make_runs_from_spans(cl) or [_make_run(cl)]
     if label == "pull-quote":
-        return PullQuote(runs=[_make_run(cl)])
+        return PullQuote(runs=runs)
     if label in ("h2", "h3"):
-        return Heading(level=_HEADING_LEVEL[label], runs=[_make_run(cl)])
-    return Paragraph(runs=[_make_run(cl)], align=_paragraph_align(cl))
+        return Heading(level=_HEADING_LEVEL[label], runs=runs)
+    return Paragraph(runs=runs, align=_paragraph_align(cl))
 
 
 def _convert_body_to_blocks(
@@ -436,6 +484,22 @@ def _is_paragraph_break(prev_cl: ClassifiedLine, next_cl: ClassifiedLine) -> boo
     if abs(prev_ln.dominant_size - next_ln.dominant_size) > 1.0:
         return True
 
+    # Bold-run-in-heading signal: a body line that is (almost) entirely bold
+    # sitting adjacent to a body line that is (almost) entirely non-bold is a
+    # subheading / body-prose boundary, not a wrapped paragraph. Without this
+    # signal, a run-in subheading like "We may pray God's promises" glues to
+    # the following prose in a single <p>, and — worse, across page breaks —
+    # the preceding sentence's tail gets fused with the next page's bold
+    # heading. Threshold pair (≥0.85 vs <0.5) is picked to fire on true
+    # bold headings while ignoring paragraphs that merely contain a bold
+    # phrase mid-sentence.
+    prev_all_bold = prev_ln.bold_ratio >= 0.85
+    next_all_bold = next_ln.bold_ratio >= 0.85
+    prev_body_weight = prev_ln.bold_ratio < 0.5
+    next_body_weight = next_ln.bold_ratio < 0.5
+    if (prev_all_bold and next_body_weight) or (next_all_bold and prev_body_weight):
+        return True
+
     # Same-page blank-line signal.
     if prev_ln.page == next_ln.page:
         gap = next_ln.y0 - prev_ln.y1
@@ -444,9 +508,14 @@ def _is_paragraph_break(prev_cl: ClassifiedLine, next_cl: ClassifiedLine) -> boo
             return True
 
     # First-line indent: next starts noticeably right of the previous line.
-    indent_em = next_ln.dominant_size * 0.7
-    if next_ln.x0 - prev_ln.x0 > indent_em:
-        return True
+    # Only meaningful for left-aligned text — a centered line's x0 shifts with
+    # its length, so comparing x0 between centered lines would mis-classify a
+    # short wrap-line as a new paragraph. Skip the check if either line is
+    # centered.
+    if not (prev_ln.is_centered or next_ln.is_centered):
+        indent_em = next_ln.dominant_size * 0.7
+        if next_ln.x0 - prev_ln.x0 > indent_em:
+            return True
 
     return False
 
@@ -475,26 +544,50 @@ _CONTINUATION_JOIN = " "
 def _build_paragraph(cls: list[ClassifiedLine]) -> Paragraph:
     """Fuse a run of body ClassifiedLines into one Paragraph.
 
-    Preserves per-line bold/italic distinctions by producing multiple runs
-    when formatting differs. Strips soft-hyphenation at line ends
-    ("some-\\nword" → "someword") when the next line begins lowercase.
+    Uses per-span (bold, italic) so mixed-style lines produce distinct runs
+    — the italic tail of a quote and the bold citation that follows keep
+    their semantic distinction instead of being collapsed by line-level
+    ratio. Strips soft-hyphenation at line ends when the next line begins
+    lowercase.
     """
     runs: list[TextRun] = []
-    for cl in cls:
-        text = cl.text.strip()
-        if not text:
+    for line_idx, cl in enumerate(cls):
+        line_runs = _make_runs_from_spans(cl)
+        if not line_runs:
             continue
-        bold = cl.line.bold_ratio > 0.5
-        italic = cl.line.italic_ratio > 0.5
-        if runs and runs[-1].bold == bold and runs[-1].italic == italic:
-            prev = runs[-1]
-            if prev.text.endswith("-") and text and text[0].islower():
-                prev.text = prev.text[:-1] + text
+        for run_idx, r in enumerate(line_runs):
+            is_line_start = (run_idx == 0 and line_idx > 0 and bool(runs))
+            same_style = (
+                bool(runs)
+                and runs[-1].bold == r.bold
+                and runs[-1].italic == r.italic
+            )
+            if same_style:
+                prev = runs[-1]
+                if is_line_start:
+                    if prev.text.endswith("-") and r.text and r.text[0].islower():
+                        prev.text = prev.text[:-1] + r.text
+                    elif prev.text.endswith(("–", "—")):
+                        prev.text = prev.text + r.text
+                    else:
+                        prev.text = prev.text + _CONTINUATION_JOIN + r.text
+                else:
+                    prev.text = prev.text + r.text
             else:
-                sep = "" if prev.text.endswith(("–", "—")) else _CONTINUATION_JOIN
-                prev.text = prev.text + sep + text
-        else:
-            runs.append(TextRun(text=text, bold=bold, italic=italic))
+                text = r.text
+                if is_line_start:
+                    prev = runs[-1]
+                    if prev.text.endswith("-") and text and text[0].islower():
+                        prev.text = prev.text[:-1]
+                    elif not prev.text.endswith(("–", "—", " ")) and not text.startswith(" "):
+                        text = _CONTINUATION_JOIN + text
+                runs.append(TextRun(text=text, bold=r.bold, italic=r.italic))
+    if not runs:
+        for cl in cls:
+            t = cl.text.strip()
+            if t:
+                runs.append(TextRun(text=t))
+                break
     return Paragraph(runs=runs, align=_paragraph_align_multi(cls))
 
 
@@ -735,7 +828,7 @@ def _try_collect_table(
     return Table(header_rows=header_rows, body_rows=body_rows), i - start
 
 
-_CONTINUATION_LEADERS = (")", "]", "}", ",", ";", ":", ".", "?", "!", "”", "’", "\"", "'")
+_CONTINUATION_LEADERS = (")", "]", "}", ",", ";", ":", ".", "?", "!", "”", "’", "\"", "'", "(")
 
 # Sentence-terminating characters. When the previous fragment ends with one of
 # these (optionally followed by a closing quote/bracket) it's a complete
@@ -800,7 +893,7 @@ def _looks_like_wrap_continuation(prev_text: str, next_text: str) -> bool:
         return True
     if prev_text.count("(") > prev_text.count(")"):
         return True
-    if prev_text.endswith("-"):
+    if prev_text.endswith(("-", "—", "–")):
         return True
     if _ends_with_sentence_terminator(prev_text):
         return False
@@ -816,13 +909,10 @@ def _looks_like_list_continuation(text: str, prev_item: ListItem) -> bool:
     return _looks_like_wrap_continuation(prev_text, text)
 
 
-def _extend_list_item(item: ListItem, cl: ClassifiedLine) -> None:
-    """Append a wrapped-continuation line's text onto the item's last run."""
-    text = cl.text.strip()
+def _append_text_to_item(item: ListItem, text: str, bold: bool, italic: bool) -> None:
+    """Append `text` onto the item, merging into the last run when styles match."""
     if not text:
         return
-    bold = cl.line.bold_ratio > 0.5
-    italic = cl.line.italic_ratio > 0.5
     if item.runs and item.runs[-1].bold == bold and item.runs[-1].italic == italic:
         last = item.runs[-1]
         if last.text.endswith("-") and text and text[0].islower():
@@ -832,6 +922,26 @@ def _extend_list_item(item: ListItem, cl: ClassifiedLine) -> None:
             last.text = last.text + sep + text
     else:
         item.runs.append(TextRun(text=text, bold=bold, italic=italic))
+
+
+def _extend_list_item(item: ListItem, cl: ClassifiedLine) -> None:
+    """Append a wrapped-continuation line's whole text onto the item."""
+    _append_text_to_item(
+        item,
+        cl.text.strip(),
+        bold=cl.line.bold_ratio > 0.5,
+        italic=cl.line.italic_ratio > 0.5,
+    )
+
+
+def _split_bullet_content(text: str) -> list[str]:
+    """Split a bullet item's content on interior bullet delimiters.
+
+    "Foo • Bar • Baz" → ["Foo", "Bar", "Baz"]
+    "Foo •"           → ["Foo", ""]   (trailing empty ⇒ dangling bullet)
+    "Foo"             → ["Foo"]
+    """
+    return [p.strip() for p in _INTERIOR_BULLET_RE.split(text)]
 
 
 def _collect_list(
@@ -846,6 +956,7 @@ def _collect_list(
     interruption_buffer: list[Block] = []
     interruption_start_i: int | None = None
     starting_num = 1
+    pending_new_item = False
 
     first_text = lines[start].text.strip()
     if style == "ordered":
@@ -864,6 +975,21 @@ def _collect_list(
         interruption_buffer = []
         interruption_start_i = None
 
+    def _add_items_from_content(content: str) -> None:
+        """Append one or more ListItems from `content`, splitting on interior
+        bullets for unordered lists. Updates `pending_new_item` when the
+        content ends with a dangling bullet."""
+        nonlocal pending_new_item
+        if style != "unordered":
+            current_items.append(ListItem(runs=[_run(content)]))
+            pending_new_item = False
+            return
+        segs = _split_bullet_content(content)
+        pending_new_item = bool(segs) and segs[-1] == ""
+        for s in segs:
+            if s:
+                current_items.append(ListItem(runs=[_run(s)]))
+
     i = start
     while i < len(lines):
         cl = lines[i]
@@ -876,35 +1002,81 @@ def _collect_list(
 
         if item_match and item_match[0] == style:
             _flush_interruption()
-            current_items.append(ListItem(runs=[_run(item_match[1])]))
+            _add_items_from_content(item_match[1])
             i += 1
             continue
 
         if item_match:
             break
 
+        # Previous item ended with a dangling `•` — this body line's text is
+        # the start of a new item (whose bullet was consumed by the wrap on
+        # the previous PDF line). Split on any interior bullets it also has.
+        if (
+            cl.label == "body"
+            and current_items
+            and not interruption_buffer
+            and pending_new_item
+        ):
+            _add_items_from_content(text)
+            i += 1
+            continue
+
         # Wrapped-continuation: a body line whose text starts with lowercase
         # or a closing bracket/quote/punctuation (or where the previous item
         # ended mid-citation with an unmatched "(") is almost certainly the
         # tail of a wrapped list item, not the start of interrupting content.
         # Merge it into the previous ListItem instead of ending the list.
+        # If the continuation also carries interior bullets (multiple items
+        # packed into the same wrapped PDF line), split them off as new items.
         if (
             cl.label == "body"
             and current_items
             and not interruption_buffer
             and _looks_like_list_continuation(text, current_items[-1])
         ):
-            _extend_list_item(current_items[-1], cl)
+            if style == "unordered":
+                segs = _split_bullet_content(text)
+                bold = cl.line.bold_ratio > 0.5
+                italic = cl.line.italic_ratio > 0.5
+                if segs:
+                    _append_text_to_item(current_items[-1], segs[0], bold, italic)
+                    pending_new_item = segs[-1] == "" and len(segs) > 1
+                    for s in segs[1:]:
+                        if s:
+                            current_items.append(ListItem(runs=[_run(s)]))
+            else:
+                _extend_list_item(current_items[-1], cl)
             i += 1
             continue
 
         if interruption_start_i is None:
             interruption_start_i = i
 
-        block = _line_to_simple_block(cl)
-        if block is not None:
-            interruption_buffer.append(block)
-        i += 1
+        if cl.label == "body":
+            # Batch consecutive body lines into one Paragraph. Without this,
+            # multi-line prose commentary that sits between list items (e.g. a
+            # numbered list where each heading is followed by a 3-line
+            # explanation) fragments into separate one-line <p> elements.
+            body_lines = [cl]
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if nxt.label != "body":
+                    break
+                if _detect_list_item(nxt.text.strip()):
+                    break
+                if _is_paragraph_break(body_lines[-1], nxt):
+                    break
+                body_lines.append(nxt)
+                j += 1
+            interruption_buffer.append(_build_paragraph(body_lines))
+            i = j
+        else:
+            block = _line_to_simple_block(cl)
+            if block is not None:
+                interruption_buffer.append(block)
+            i += 1
 
         if len(interruption_buffer) > 4:
             break
@@ -991,15 +1163,17 @@ def _merge_adjacent_pullquotes(blocks: list[Block]) -> list[Block]:
             next_text = "".join(r.text for r in b.runs)
             if _looks_like_wrap_continuation(prev_text, next_text):
                 # The paragraph is the tail of the quote whose leading lines
-                # were italic; the last line often lost italic classification
-                # because the PDF renderer switched font mid-line. Coerce to
-                # italic so the whole quote reads as one continuous block.
+                # were italic; last-line italic often gets misdetected because
+                # the PDF renderer switched font mid-line. Coerce italic — but
+                # NOT onto bold runs, which are almost always the standalone
+                # bold scripture citation ("— Matthew 9:37-38 (NKJV)") whose
+                # correct rendering is <strong> alone, not <strong><em>.
                 prev_italic = any(r.italic for r in out[-1].runs)
                 coerced = [
                     TextRun(
                         text=r.text,
                         bold=r.bold,
-                        italic=r.italic or prev_italic,
+                        italic=r.italic or (prev_italic and not r.bold),
                         small_caps=r.small_caps,
                         link=r.link,
                     )
@@ -1015,6 +1189,79 @@ def _merge_adjacent_pullquotes(blocks: list[Block]) -> list[Block]:
 
 def _pullquote_text(q: PullQuote) -> str:
     return " ".join(r.text for r in q.runs)
+
+
+def _all_italic(runs: list[TextRun]) -> bool:
+    """True iff every non-empty run is italic (and none is bold)."""
+    non_empty = [r for r in runs if r.text.strip()]
+    if not non_empty:
+        return False
+    return all(r.italic and not r.bold for r in non_empty)
+
+
+def _all_bold(runs: list[TextRun]) -> bool:
+    non_empty = [r for r in runs if r.text.strip()]
+    if not non_empty:
+        return False
+    return all(r.bold for r in non_empty)
+
+
+def _is_scripture_citation_line(text: str) -> bool:
+    """True iff `text` looks like a standalone citation ("— Psalm 33:9, NKJV")."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped[0] not in "—–-":
+        return False
+    return _is_scripture_text(stripped)
+
+
+def _strip_citation_dash(text: str) -> str:
+    """Drop the leading em/en/hyphen dash + whitespace from a citation string."""
+    return text.lstrip("—–- \t")
+
+
+def _pair_scripture_citations(blocks: list[Block]) -> list[Block]:
+    """Merge italic-verse + bold-citation pairs into `scripture` PullQuotes.
+
+    Source manuscripts render each scripture as two visually-separate lines:
+    an italic verse followed by a right-aligned bold "— Book chap:verse, VER"
+    citation. The classifier gives us either (Paragraph italic) + (Paragraph
+    bold) or (PullQuote plain) + (Paragraph bold). This pass fuses either
+    shape into a single scripture PullQuote with the citation as its
+    `attribution`, so the writer wraps it in <blockquote class="scripture">
+    with the border/box styling defined in styles.css.
+    """
+    out: list[Block] = []
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        nxt = blocks[i + 1] if i + 1 < len(blocks) else None
+
+        verse_runs: list[TextRun] | None = None
+        if isinstance(b, Paragraph) and _all_italic(b.runs):
+            verse_runs = b.runs
+        elif isinstance(b, PullQuote) and b.role == "plain" and _all_italic(b.runs):
+            verse_runs = b.runs
+
+        if (
+            verse_runs is not None
+            and isinstance(nxt, Paragraph)
+            and _all_bold(nxt.runs)
+        ):
+            cite_text = "".join(r.text for r in nxt.runs).strip()
+            if _is_scripture_citation_line(cite_text):
+                attribution = _strip_citation_dash(cite_text)
+                out.append(PullQuote(
+                    runs=list(verse_runs),
+                    attribution=attribution,
+                    role="scripture",
+                ))
+                i += 2
+                continue
+        out.append(b)
+        i += 1
+    return out
 
 
 def _is_scripture_text(text: str) -> bool:
@@ -1100,6 +1347,7 @@ def build_book(items: list[ClassifiedLine], metadata: BookMetadata) -> Book:
                 chapter_sections.append(built)
         intro_blocks = _convert_body_to_blocks(prec.intro_lines)
         intro_blocks = _merge_adjacent_pullquotes(intro_blocks)
+        intro_blocks = _pair_scripture_citations(intro_blocks)
         _assign_pullquote_roles(intro_blocks)
         if chapter_sections:
             part_objs.append(Part(
@@ -1153,6 +1401,7 @@ def _build_section(flat: _FlatSection, slug: str) -> Section:
     join = not _looks_like_toc_title(flat.title)
     content = _convert_body_to_blocks(flat.body_lines, join_paragraphs=join)
     content = _merge_adjacent_pullquotes(content)
+    content = _pair_scripture_citations(content)
     _assign_pullquote_roles(content)
     return Section(
         title=flat.title,

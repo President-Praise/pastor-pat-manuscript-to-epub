@@ -218,6 +218,7 @@ class BookMetadata:
     author: str
     language: str = "en"
     identifier: str | None = None
+    cover_image_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.title.strip():

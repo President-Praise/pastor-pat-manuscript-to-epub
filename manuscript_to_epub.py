@@ -21,6 +21,10 @@ from mte.build_ir import build_book
 from mte.ir import BookMetadata
 from mte.epub_writer import write_epub
 from mte.self_check import run_self_checks
+from mte.verify import (
+    verify_structural, raw_text_diff, write_html_report,
+)
+from mte.visual import verify_visual
 
 
 def _load_lines(input_path: Path):
@@ -94,6 +98,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     metadata = BookMetadata(
         title=args.title, author=args.author, language=args.language,
+        cover_image_path=args.cover,
     )
     book = build_book(items, metadata)
     n_sections = sum(1 for _ in book.walk_sections())
@@ -113,7 +118,59 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"  {len(report.failures)} of {len(report.results)} checks FAILED:", file=sys.stderr)
         for f in report.failures[:40]:
             print(f"    FAIL [{f.section_slug}] {f.check}: {f.detail}", file=sys.stderr)
-    return 0 if report.passed else 1
+
+    # Layer 1: IR vs written EPUB (structural parity). Non-fatal — always report.
+    print(file=sys.stderr)
+    print("Verify (Layer 1 — IR vs EPUB):", file=sys.stderr)
+    vreport = verify_structural(book, epub.output_path)
+    html_out = Path("out/verify") / f"{Path(args.output).stem}-diff.html"
+    write_html_report(vreport, html_out, pdf_name=input_path.name,
+                      epub_name=Path(args.output).name)
+    for line in vreport.format().splitlines():
+        print(f"  {line}", file=sys.stderr)
+    print(f"  HTML report: {html_out}", file=sys.stderr)
+
+    return 0 if (report.passed and vreport.ok) else 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    pdf_path = Path(args.pdf)
+    epub_path = Path(args.epub)
+    for p in (pdf_path, epub_path):
+        if not p.exists():
+            print(f"error: not found: {p}", file=sys.stderr)
+            return 2
+
+    print(f"Rebuilding IR from {pdf_path.name} ...", file=sys.stderr)
+    spans, lines = _load_lines(pdf_path)
+    kept, _ = preprocess(lines)
+    tiers = assign_tiers(kept)
+    items = classify(kept, tiers)
+    metadata = BookMetadata(
+        title=args.title, author=args.author, language=args.language,
+    )
+    book = build_book(items, metadata)
+
+    print("Verify (Layer 1 — IR vs EPUB):", file=sys.stderr)
+    vreport = verify_structural(book, epub_path)
+    html_out = Path("out/verify") / f"{epub_path.stem}-diff.html"
+    write_html_report(vreport, html_out, pdf_name=pdf_path.name, epub_name=epub_path.name)
+    print(vreport.format())
+    print(f"\nHTML report: {html_out}", file=sys.stderr)
+
+    if args.raw:
+        print("\nVerify (Layer 3 — raw PDF text vs flattened EPUB):", file=sys.stderr)
+        raw = raw_text_diff(pdf_path, epub_path)
+        print(raw.format())
+
+    if args.visual:
+        print("\nVerify (Layer 2 — visual side-by-side):", file=sys.stderr)
+        visual_dir = Path("out/verify") / f"{epub_path.stem}-visual"
+        vis = verify_visual(pdf_path, epub_path, visual_dir)
+        for line in vis.format().splitlines():
+            print(f"  {line}", file=sys.stderr)
+
+    return 0 if vreport.ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -130,7 +187,29 @@ def main(argv: list[str] | None = None) -> int:
     p_build.add_argument("--author", required=True)
     p_build.add_argument("--output", required=True, help="Output .epub path")
     p_build.add_argument("--language", default="en")
+    p_build.add_argument("--cover", default=None, help="Path to cover image (jpg/png)")
     p_build.set_defaults(func=cmd_build)
+
+    p_verify = sub.add_parser(
+        "verify",
+        help="Diff an already-written EPUB against its source manuscript",
+    )
+    p_verify.add_argument("pdf", help="Path to source manuscript (.pdf)")
+    p_verify.add_argument("epub", help="Path to generated .epub")
+    p_verify.add_argument(
+        "--title", default="verify", help="Title metadata (only used for IR construction)",
+    )
+    p_verify.add_argument("--author", default="verify")
+    p_verify.add_argument("--language", default="en")
+    p_verify.add_argument(
+        "--raw", action="store_true",
+        help="Also run Layer 3 (classifier-independent raw text diff — noisy, spot-check only)",
+    )
+    p_verify.add_argument(
+        "--visual", action="store_true",
+        help="Also run Layer 2 (render EPUB via Calibre, emit side-by-side page contact sheets)",
+    )
+    p_verify.set_defaults(func=cmd_verify)
 
     args = p.parse_args(argv)
     return args.func(args)

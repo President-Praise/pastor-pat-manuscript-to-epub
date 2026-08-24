@@ -192,8 +192,12 @@ def extract_spans(pdf_path: str) -> list[Span]:
 def group_into_lines(spans: list[Span], y_tol: float = 2.0) -> list[Line]:
     """Group spans that share (page, baseline) into visual lines.
 
-    We do it per-page and cluster by y0 rounded to `y_tol` points, then sort
-    each cluster left-to-right by x0.
+    Per-page sort by y0, then walk in order and merge into the current line
+    while the next span's y0 is within `y_tol` of the line's median y0.
+    Adjacency clustering, not fixed binning: two spans that share a baseline
+    but straddle a bin boundary (e.g. y=396.9 vs y=397.3 with y_tol=2.0)
+    stay together, where round-to-bucket would have split them and produced
+    a spurious "extra line" that corrupts wrap-continuation detection.
     """
     by_page: dict[int, list[Span]] = {}
     for s in spans:
@@ -201,16 +205,20 @@ def group_into_lines(spans: list[Span], y_tol: float = 2.0) -> list[Line]:
 
     lines: list[Line] = []
     for page in sorted(by_page):
-        page_spans = by_page[page]
-        # Cluster by baseline (y0). Bin to nearest y_tol.
-        buckets: dict[int, list[Span]] = {}
+        page_spans = sorted(by_page[page], key=lambda s: (s.y0, s.x0))
+        current: list[Span] = []
+        current_ys: list[float] = []
         for s in page_spans:
-            key = int(round(s.y0 / y_tol))
-            buckets.setdefault(key, []).append(s)
-        # Emit in top-to-bottom order.
-        for key in sorted(buckets):
-            group = sorted(buckets[key], key=lambda s: s.x0)
-            lines.append(Line(spans=group))
+            if current and (s.y0 - (sum(current_ys) / len(current_ys))) < y_tol:
+                current.append(s)
+                current_ys.append(s.y0)
+            else:
+                if current:
+                    lines.append(Line(spans=sorted(current, key=lambda x: x.x0)))
+                current = [s]
+                current_ys = [s.y0]
+        if current:
+            lines.append(Line(spans=sorted(current, key=lambda x: x.x0)))
     return lines
 
 

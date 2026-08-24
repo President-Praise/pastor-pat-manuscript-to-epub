@@ -22,6 +22,39 @@ from .pdf_extract import Line, Span
 DECORATIVE_CHARS = set("✦❖❦♚♛✧✩✪★☆•●◆◇◈❧⚜❈❃❊§¶—–_")
 
 
+def _is_wrap_continuation_of_prev(lines: list[Line], i: int) -> bool:
+    """True if `lines[i]` is a same-size continuation of `lines[i-1]`.
+
+    Drop-cap merges (single- and multi-letter) must not fire on a line that
+    is really the *second visual line of a wrapped heading*. A two-line
+    title like:
+        line[i-1]: "BELIEVERS AS PRIESTS AND"   (28pt, bold)
+        line[i]:   "KINGS"                       (28pt, bold)
+        line[i+1]: "Recovering the Royal..."     (13pt, subtitle)
+    exactly matches the drop-cap heuristic if we look only at (i, i+1) —
+    "KINGS" is an all-caps short line above a smaller line. But it is not
+    a drop-cap row; it is a wrap of the heading above it, and treating it
+    otherwise scrambles the subtitle by prepending K/I/N/G/S letters into
+    unrelated words. Guard: if the immediately-preceding kept line is
+    same-page, same-size, same-bold, and vertically adjacent, this line
+    belongs to that heading — bail out.
+    """
+    if i == 0:
+        return False
+    prev = lines[i - 1]
+    ln = lines[i]
+    if prev.page != ln.page:
+        return False
+    if abs(prev.dominant_size - ln.dominant_size) > 0.5:
+        return False
+    if (prev.bold_ratio > 0.5) != (ln.bold_ratio > 0.5):
+        return False
+    line_h = max(prev.dominant_size, ln.dominant_size)
+    if (ln.y0 - prev.y1) > line_h * 1.5:
+        return False
+    return True
+
+
 @dataclass
 class StripReport:
     header_lines_removed: int = 0
@@ -197,7 +230,12 @@ def _merge_drop_caps(lines: list[Line]) -> tuple[list[Line], int]:
             skip_next = False
             continue
         text = ln.text.strip()
-        if len(text) == 1 and text.isalpha() and i + 1 < len(lines):
+        if (
+            len(text) == 1
+            and text.isalpha()
+            and i + 1 < len(lines)
+            and not _is_wrap_continuation_of_prev(lines, i)
+        ):
             nxt = lines[i + 1]
             if nxt.page == ln.page and 0 <= (nxt.y0 - ln.y0) < ln.page_height * 0.05:
                 if ln.dominant_size > nxt.dominant_size * 1.2:
@@ -262,6 +300,24 @@ def _word_x_starts(line: Line) -> list[tuple[int, float, str]]:
     return words
 
 
+def _tail_is_all_caps_heading(text: str) -> bool:
+    """True iff the tail candidate is an all-uppercase heading skeleton.
+
+    Real drop-cap targets like 'OW TO SE HIS ANUAL' are entirely uppercase —
+    the heading is 'HOW TO USE THIS MANUAL' with the first letter of each
+    word replaced by a decorative drop cap on the line above. A tail that
+    contains any lowercase letters (e.g. 'When the Sea is Raging, the
+    Saints Must Not Be Sleeping', 'Recovering the Royal and Priestly
+    Identity of the Church') is a normal sentence and must not have caps
+    prepended to its words. Digits are allowed (headings can contain
+    "PSALM 23") — only lowercase letters disqualify.
+    """
+    for c in text:
+        if c.isalpha() and c.islower():
+            return False
+    return True
+
+
 def _merge_split_initial_caps(lines: list[Line]) -> tuple[list[Line], int]:
     """Handle multi-letter initial-cap drop-cap layouts.
 
@@ -284,17 +340,24 @@ def _merge_split_initial_caps(lines: list[Line]) -> tuple[list[Line], int]:
             continue
         text = ln.text.strip()
         letters = [c for c in text if c.isalpha()]
+        # Limit raised from 8 → 10 to cover the AUDACIOUS Ch 4-12 heading
+        # "PRAYER FOR ASSIGNMENTS AND NATIONS: THE ELIJAH-JOSHUA-DANIEL-ESTHER
+        # PATTERN" (9 drop caps: PANTEJDEP). NOTE: even at 10, the ELIJAH-JOSHUA
+        # -DANIEL-ESTHER hyphens are still dropped by this merger, gluing the
+        # tail words together (→ "ELIJAHJOSHUADANIELESTHER"). See TODO below.
         if (
-            2 <= len(letters) <= 8
+            2 <= len(letters) <= 10
             and all(c.isupper() for c in letters)
             and not any(c.isdigit() for c in text)
             and i + 1 < len(lines)
+            and not _is_wrap_continuation_of_prev(lines, i)
         ):
             nxt = lines[i + 1]
             if (
                 nxt.page == ln.page
                 and 0 <= (nxt.y0 - ln.y0) < ln.page_height * 0.05
                 and ln.dominant_size > nxt.dominant_size * 1.15
+                and _tail_is_all_caps_heading(nxt.text)
             ):
                 cap_positions: list[tuple[float, str]] = []
                 if len(ln.spans) == 1:
@@ -365,6 +428,25 @@ def _merge_split_initial_caps(lines: list[Line]) -> tuple[list[Line], int]:
                             continue
         out.append(ln)
     return out, merges
+
+# TODO(drop-cap hyphens): The tail line's small-caps text uses hyphens as
+# word separators in some AUDACIOUS Ch 4-12 headings, e.g. the source
+#   "PRAYER FOR ASSIGNMENTS AND NATIONS: THE ELIJAH-JOSHUA-DANIEL-ESTHER
+#    PATTERN"
+# gets extracted as one visual line where "ELIJAH-JOSHUA-DANIEL-ESTHER" is
+# a single hyphen-joined token. _word_x_starts splits on whitespace only, so
+# it sees ONE word starting at the E position. The first drop cap E lands,
+# but the caps for J, D, and the second E have nowhere to go and are
+# dropped, and the internal hyphens are also lost — giving the observed
+# post-fix output
+#   "PRAYER FOR ASSIGNMENTS AND NATIONS THE ELIJAHOSHUAANIELSTHER PATTERN"
+# (three missing caps + three missing hyphens; four names glued into one).
+# Fix: split _word_x_starts on hyphens as well as whitespace, then re-emit
+# hyphens between the assigned caps.
+#
+# Same fix will restore the missing hyphen in
+#   "PRAYER FOR CHILDREN AND FAMILIES: THE HANNAH-SYROPHOENICIAN PATTERN"
+# currently emitted as "…THE HANNAHYROPHOENICIAN PATTERN".
 
 
 def preprocess(lines: list[Line]) -> tuple[list[Line], StripReport]:
